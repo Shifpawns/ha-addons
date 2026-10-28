@@ -119,8 +119,6 @@ class Speaker:
         self.ma_volume = None
         self.ignore_ma_until = 0.0
         self.on_button = None
-        self.status = None
-        self.mc_seen = {}
         self.paused_at = 0.0
         self.played_at = 0.0
         self.on_ma_volume = None
@@ -150,12 +148,6 @@ class Speaker:
             pkt, addr = self.heartbeat.recvfrom(4096)
             if addr[0] == SPEAKER:
                 self.last_seen = time.time()
-                if len(pkt) >= 72:
-                    key = (word(pkt, 14), word(pkt, 16))
-                    body = pkt[96:]
-                    if key not in ((6, 1), (1, 17)) and self.mc_seen.get(key) != body:
-                        self.mc_seen[key] = body
-                        log(f"multicast {key} van speaker, {len(pkt)} bytes: {body.hex()}")
 
     def listen(self):
         while True:
@@ -173,13 +165,6 @@ class Speaker:
             session = self.session
             if session is not None:
                 session.handle(key, pkt)
-            if key in ((6, 23), (6, 40)):
-                log(f"speaker meldt {key}, sessie {'actief' if session and session.running else 'uit'}")
-            if key == (1, 44):
-                status = pkt[96:]
-                if status != self.status:
-                    log(f"speaker status {len(pkt)} bytes: {status.hex()}")
-                    self.status = status
             if key == (6, 23) and session is not None and session.running and not session.stopped_by_speaker:
                 session.stopped_by_speaker = True
                 self.paused_at = time.monotonic()
