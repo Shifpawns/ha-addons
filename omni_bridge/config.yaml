@@ -1,5 +1,5 @@
 name: Omni 10 Bridge
-version: "1.4.1"
+version: "1.4.2"
 slug: omni_bridge
 description: Volume en afspelen op een Harman Kardon Omni 10, met Music Assistant
 arch:

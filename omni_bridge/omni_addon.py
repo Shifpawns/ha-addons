@@ -118,6 +118,7 @@ class Speaker:
         self.seen = set()
         self.ma_volume = None
         self.ignore_ma_until = 0.0
+        self.on_speaker_stop = None
         self.on_ma_volume = None
         self.sock = multicast_socket("", LOCAL_PORT, self.ip)
         self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, self.my_ip)
@@ -162,6 +163,8 @@ class Speaker:
             session = self.session
             if session is not None:
                 session.handle(key, pkt)
+                if key == (6, 23) and session.running and self.on_speaker_stop:
+                    self.on_speaker_stop()
             if key not in KNOWN and key not in self.seen:
                 self.seen.add(key)
                 log(f"onbekend pakket {key} van speaker, {len(pkt)} bytes: {pkt[72:160].hex()}")
@@ -191,6 +194,7 @@ class Session:
         self.frame_pos = 1
         self.marked = None
         self.late = 0
+        self.phase = None
         self.behind = 0.0
         self.resend_count = 0
         self.last_sent = 0.0
@@ -211,8 +215,13 @@ class Session:
         if key == (3, 12) and len(pkt) >= 128:
             self.clock = struct.unpack_from("<I", pkt, 124)[0]
             self.clock_at = time.monotonic()
-        elif key == (4, 9) and len(pkt) >= 156:
-            self.resend(pkt)
+        elif key == (4, 9):
+            phase = word(pkt, 25) if len(pkt) >= 104 else None
+            if phase != self.phase:
+                log(f"speaker fase {self.phase} -> {phase}")
+                self.phase = phase
+            if len(pkt) >= 156:
+                self.resend(pkt)
         if key in self.events:
             self.events[key].set()
 
@@ -434,7 +443,10 @@ def strip_silence(data):
 def volume_to_gain(volume):
     if volume <= 0:
         return 0
-    db = (volume - 100) * 50 / 101
+    if volume > 25:
+        db = (volume - 100) * 37 / 75
+    else:
+        db = volume * 37 / 25 - 74
     mult = 10 ** (db / 20)
     if db >= -30:
         return int(mult * 256 + 0.5) * 256
@@ -656,6 +668,7 @@ def main():
         client.publish(T_VOLUME, str(volume), retain=True)
         if volume != speaker.ma_volume:
             speaker.ma_volume = volume
+            speaker.ignore_ma_until = max(speaker.ignore_ma_until, time.monotonic() + 1.5)
             threading.Thread(target=ma_service, args=("volume_set", {"volume_level": volume / 50}), daemon=True).start()
 
     def on_ma_volume(volume):
@@ -667,7 +680,12 @@ def main():
             log("volume uit MA ->", target)
             speaker.set_volume(target)
 
+    def on_speaker_stop():
+        log("speaker heeft de sessie gestopt, MA pauzeren")
+        threading.Thread(target=ma_service, args=("media_pause",), daemon=True).start()
+
     speaker.on_ma_volume = on_ma_volume
+    speaker.on_speaker_stop = on_speaker_stop
 
     speaker.on_volume = on_volume
     client.on_connect = on_connect
