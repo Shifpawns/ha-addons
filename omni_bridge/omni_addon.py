@@ -120,6 +120,7 @@ class Speaker:
         self.ignore_ma_until = 0.0
         self.on_button = None
         self.status = None
+        self.mc_seen = {}
         self.paused_at = 0.0
         self.played_at = 0.0
         self.on_ma_volume = None
@@ -149,6 +150,12 @@ class Speaker:
             pkt, addr = self.heartbeat.recvfrom(4096)
             if addr[0] == SPEAKER:
                 self.last_seen = time.time()
+                if len(pkt) >= 72:
+                    key = (word(pkt, 14), word(pkt, 16))
+                    body = pkt[96:]
+                    if key not in ((6, 1), (1, 17)) and self.mc_seen.get(key) != body:
+                        self.mc_seen[key] = body
+                        log(f"multicast {key} van speaker, {len(pkt)} bytes: {body.hex()}")
 
     def listen(self):
         while True:
