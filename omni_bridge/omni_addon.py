@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+import urllib.request
 import os
 import select
 import socket
@@ -35,8 +36,6 @@ FRAME_BYTES = FRAME * 4
 LEAD = 1.5
 DATA_BYTES = 1316
 IDLE_STOP = 2.0
-SESSION_IDLE = 60
-FAST_SWITCH = os.environ.get("FAST_SWITCH", "true") == "true"
 GAP = bytes(256)
 START_DELAY = 1.5
 RESYNC_AFTER = 1.0
@@ -67,6 +66,10 @@ T_AVAIL = f"{BASE}/available"
 T_VOLUME = f"{BASE}/volume"
 T_VOLUME_SET = f"{BASE}/volume/set"
 T_PLAYING = f"{BASE}/playing"
+
+KNOWN = {(1, 17), (1, 46), (3, 12), (3, 39), (4, 9), (6, 1), (6, 3), (6, 34)}
+HA_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
+MA_PLAYER = os.environ.get("MA_PLAYER", "")
 
 
 def log(*args):
@@ -112,6 +115,9 @@ class Speaker:
         self.session = None
         self.on_volume = None
         self.flushed = threading.Event()
+        self.seen = set()
+        self.ma_volume = None
+        self.on_ma_volume = None
         self.sock = multicast_socket("", LOCAL_PORT, self.ip)
         self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, self.my_ip)
         self.heartbeat = multicast_socket(MCAST, SPEAKER_PORT, self.ip)
@@ -155,6 +161,9 @@ class Speaker:
             session = self.session
             if session is not None:
                 session.handle(key, pkt)
+            if key not in KNOWN and key not in self.seen:
+                self.seen.add(key)
+                log(f"onbekend pakket {key} van speaker, {len(pkt)} bytes: {pkt[72:160].hex()}")
 
 
 class Session:
@@ -172,7 +181,6 @@ class Session:
         self.resent = {}
         self.encoder = Encoder(bits_per_sample=BITS)
         self.running = False
-        self.armed = False
         self.frame_no = 0
         self.counter = 0
         self.data = bytearray()
@@ -301,27 +309,6 @@ class Session:
         self.speaker.send(cfg)
         self.play_at = time.monotonic() + START_DELAY
         self.stream_start = time.monotonic()
-        self.armed = True
-
-    def halt(self):
-        self.data = bytearray()
-        self.frame_off = None
-        self.last_off = None
-        self.message("stop", copies=2)
-        self.armed = False
-
-    def rearm(self):
-        self.encoder = Encoder(bits_per_sample=BITS)
-        self.frame_no = 0
-        self.packet_pos = 1
-        self.frame_pos = 1
-        self.marked = None
-        self.behind = 0.0
-        self.sync_burst(2, 3)
-        self.start_clock()
-
-    def played_out(self):
-        return time.monotonic() > self.play_at + self.frame_no * FRAME_SEC + 0.3
 
     def housekeeping(self):
         round_no = 3
@@ -443,10 +430,33 @@ def strip_silence(data):
         i = end
 
 
+def volume_to_gain(volume):
+    if volume <= 0:
+        return 0
+    db = (volume - 100) * 50 / 101
+    mult = 10 ** (db / 20)
+    if db >= -30:
+        return int(mult * 256 + 0.5) * 256
+    return int(mult * 65536 + 0.5)
+
+
+GAINS = [volume_to_gain(v) for v in range(101)]
+
+
+def gain_to_volume(gain):
+    return min(range(101), key=lambda v: abs(GAINS[v] - gain))
+
+
 def watch_squeezelite(stream, speaker):
     for line in stream:
         line = line.decode(errors="replace").strip()
-        if "strm command" in line:
+        if "audg gainL:" in line:
+            parts = line.split()
+            gain = int(parts[parts.index("gainL:") + 1])
+            adjust = parts[parts.index("adjust:") + 1] != "0"
+            if adjust and speaker.on_ma_volume:
+                speaker.on_ma_volume(gain_to_volume(gain))
+        elif "strm command" in line:
             command = line[-1]
             if command in "qfp":
                 speaker.flushed.set()
@@ -470,20 +480,6 @@ def player(speaker, templates, client):
         buf = bytearray()
         session = None
         silent_since = None
-
-        def end_session(reason):
-            nonlocal session
-            log(f"{reason}, {session_stats(session)}")
-            session.close(wait=False)
-            speaker.session = None
-            session = None
-            client.publish(T_PLAYING, "OFF", retain=True)
-
-        def stop_audio(reason):
-            log(f"{reason}, {session_stats(session)}")
-            session.halt()
-            client.publish(T_PLAYING, "OFF", retain=True)
-
         while True:
             ready, _, _ = select.select([fd], [], [], 1.0)
             if not ready:
@@ -498,11 +494,12 @@ def player(speaker, templates, client):
                 drain(fd)
                 raw.clear()
                 buf.clear()
-                if session is not None and session.armed:
-                    if FAST_SWITCH:
-                        stop_audio("overgeslagen of gepauzeerd")
-                    else:
-                        end_session("overgeslagen of gepauzeerd")
+                if session is not None:
+                    log(f"overgeslagen of gepauzeerd, {session_stats(session)}")
+                    session.close(wait=False)
+                    speaker.session = None
+                    session = None
+                    client.publish(T_PLAYING, "OFF", retain=True)
                 continue
             raw += chunk
             usable = len(raw) & ~3
@@ -515,7 +512,7 @@ def player(speaker, templates, client):
                 silent_since = None
             elif silent_since is None:
                 silent_since = now
-            if buf and session is None:
+            if session is None and buf:
                 session = Session(speaker, templates)
                 speaker.session = session
                 if not session.open():
@@ -526,31 +523,24 @@ def player(speaker, templates, client):
                     continue
                 log("afspelen gestart")
                 client.publish(T_PLAYING, "ON", retain=True)
-            elif buf and not session.armed:
-                session.rearm()
-                log("afspelen gestart (zelfde sessie)")
-                client.publish(T_PLAYING, "ON", retain=True)
             while session is not None and len(buf) >= FRAME_BYTES and not speaker.flushed.is_set():
                 session.push(bytes(buf[:FRAME_BYTES]))
                 del buf[:FRAME_BYTES]
                 if session.behind > RESYNC_AFTER:
-                    end_session("te ver achter, sessie opnieuw starten")
+                    log(f"te ver achter, sessie opnieuw starten, {session_stats(session)}")
+                    session.close(wait=False)
+                    speaker.session = None
+                    session = None
                     time.sleep(0.5)
-            if session is not None and silent_since is not None:
-                quiet = now - silent_since
-                if session.armed and quiet > IDLE_STOP:
-                    if buf:
-                        session.push(bytes(buf.ljust(FRAME_BYTES, b"\0")), last=True)
-                        buf.clear()
-                    if session.data:
-                        session.flush()
-                    if session.played_out():
-                        if FAST_SWITCH:
-                            stop_audio("afspelen gestopt")
-                        else:
-                            end_session("afspelen gestopt")
-                elif not session.armed and quiet > SESSION_IDLE:
-                    end_session("sessie gesloten")
+            if session is not None and silent_since is not None and now - silent_since > IDLE_STOP:
+                if buf:
+                    session.push(bytes(buf.ljust(FRAME_BYTES, b"\0")), last=True)
+                    buf.clear()
+                session.close()
+                log(f"afspelen gestopt, {session_stats(session)}")
+                speaker.session = None
+                session = None
+                client.publish(T_PLAYING, "OFF", retain=True)
             if not got_audio:
                 time.sleep(0.02)
         if session is not None:
@@ -560,6 +550,40 @@ def player(speaker, templates, client):
         proc.wait()
         log("squeezelite gestopt, opnieuw over 3 s")
         time.sleep(3)
+
+
+def ha_request(path, data=None):
+    req = urllib.request.Request(
+        f"http://supervisor/core/api/{path}",
+        data=json.dumps(data).encode() if data is not None else None,
+        headers={"Authorization": f"Bearer {HA_TOKEN}", "Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=5) as resp:
+        return json.load(resp)
+
+
+def find_ma_player():
+    if MA_PLAYER:
+        return MA_PLAYER
+    try:
+        for state in ha_request("states"):
+            attrs = state.get("attributes", {})
+            if state["entity_id"].startswith("media_player.") and "mass_player_type" in attrs and attrs.get("friendly_name") == NAME:
+                return state["entity_id"]
+    except Exception as err:
+        log("HA niet bereikbaar:", err)
+    return None
+
+
+def ma_service(service, data=None):
+    entity = find_ma_player()
+    if not entity:
+        log("geen Music Assistant-speler gevonden in HA")
+        return
+    try:
+        ha_request(f"services/media_player/{service}", {"entity_id": entity, **(data or {})})
+    except Exception as err:
+        log(f"{service} naar MA mislukt:", err)
 
 
 def discovery(client):
@@ -628,6 +652,18 @@ def main():
 
     def on_volume(volume):
         client.publish(T_VOLUME, str(volume), retain=True)
+        if volume != speaker.ma_volume:
+            speaker.ma_volume = volume
+            threading.Thread(target=ma_service, args=("volume_set", {"volume_level": volume / 50}), daemon=True).start()
+
+    def on_ma_volume(volume):
+        target = (volume + 1) // 2
+        speaker.ma_volume = target
+        if target != speaker.volume:
+            log("volume uit MA ->", target)
+            speaker.set_volume(target)
+
+    speaker.on_ma_volume = on_ma_volume
 
     speaker.on_volume = on_volume
     client.on_connect = on_connect

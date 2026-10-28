@@ -5,7 +5,9 @@ export SPEAKER_NAME="$(bashio::config 'speaker_name')"
 LMS_SERVER="$(bashio::config "music_server")"
 [ "$LMS_SERVER" = "null" ] && LMS_SERVER=""
 export LMS_SERVER
-export FAST_SWITCH="$(bashio::config 'fast_switch')"
+MA_PLAYER="$(bashio::config "ma_player")"
+[ "$MA_PLAYER" = "null" ] && MA_PLAYER=""
+export MA_PLAYER
 export BITS_PER_SAMPLE="$(bashio::config 'quality')"
 export MQTT_HOST="$(bashio::services mqtt 'host')"
 export MQTT_PORT="$(bashio::services mqtt 'port')"
