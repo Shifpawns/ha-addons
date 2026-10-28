@@ -24,6 +24,7 @@ MQTT_USER = os.environ.get("MQTT_USER", "")
 MQTT_PASS = os.environ.get("MQTT_PASS", "")
 LMS_SERVER = os.environ.get("LMS_SERVER", "")
 PLAYER_MAC = os.environ.get("PLAYER_MAC", "02:38:29:1e:0b:0d")
+SYNC_MS = int(float(os.environ.get("SYNC_DELAY_MS", "2500")))
 BITS = float(os.environ.get("BITS_PER_SAMPLE", "2.5"))
 
 SPEAKER_PORT = 6060
@@ -39,6 +40,7 @@ IDLE_STOP = 2.0
 GAP = bytes(256)
 START_DELAY = 1.5
 RESYNC_AFTER = 1.0
+STRETCH_BELOW = START_DELAY - 0.4
 OFFLINE_AFTER = 90
 
 AUDIO_CHECK = {
@@ -204,6 +206,7 @@ class Session:
         self.frame_pos = 1
         self.marked = None
         self.late = 0
+        self.stretched = 0
         self.stopped_by_speaker = False
         self.behind = 0.0
         self.resend_count = 0
@@ -420,7 +423,7 @@ class Session:
 
 
 def session_stats(session):
-    return f"{session.frame_no} frames, {session.late}x te laat, {session.resend_count} pakketten opnieuw"
+    return f"{session.frame_no} frames, {session.late}x te laat, {session.resend_count} pakketten opnieuw, {session.stretched} samples bijgevoegd"
 
 
 def squeezelite_command():
@@ -545,6 +548,10 @@ def player(speaker, templates, client):
             while session is not None and len(buf) >= FRAME_BYTES and not speaker.flushed.is_set():
                 session.push(bytes(buf[:FRAME_BYTES]))
                 del buf[:FRAME_BYTES]
+                slack = session.play_at + session.frame_no * FRAME_SEC - time.monotonic()
+                if slack < STRETCH_BELOW and len(buf) >= 4:
+                    buf[0:0] = buf[0:4]
+                    session.stretched += 1
                 if session.behind > RESYNC_AFTER:
                     log(f"te ver achter, sessie opnieuw starten, {session_stats(session)}")
                     session.close(wait=False)
@@ -642,6 +649,7 @@ def discovery(client):
 
 
 def main():
+    os.environ["DEVICE_FRAMES"] = str(SYNC_MS * 48)
     templates = {k: bytes.fromhex(v) for k, v in json.load(open(os.path.join(HERE, "templates.json"))).items()}
     speaker = Speaker()
     log(f"add-on op {speaker.ip}, speaker {SPEAKER}, mqtt {MQTT_HOST}:{MQTT_PORT}")

@@ -7,8 +7,8 @@ RUN git clone https://github.com/ralph-irving/squeezelite /src \
     && git checkout afa8e834b2e2774016ca244a5f19f67ed0bd7d3b \
     && sed -i 's/set_volume(audg->adjust ? audg->gainL : FIXED_ONE, audg->adjust ? audg->gainR : FIXED_ONE);/set_volume(FIXED_ONE, FIXED_ONE);/' slimproto.c \
     && grep -q "set_volume(FIXED_ONE, FIXED_ONE)" slimproto.c \
-    && sed -i 's/output.device_frames = 0;/output.device_frames = 96000;/' output_stdout.c \
-    && grep -q "device_frames = 96000" output_stdout.c \
+    && sed -i 's|output.device_frames = 0;|output.device_frames = getenv("DEVICE_FRAMES") ? atoi(getenv("DEVICE_FRAMES")) : 0;|' output_stdout.c \
+    && grep -q 'getenv("DEVICE_FRAMES")' output_stdout.c \
     && make OPTS="-DLINKALL -DRESAMPLE -DNO_FAAD -DNO_MAD" \
     && scanelf --nobanner --needed --format '%n#p' squeezelite | tr ',' '\n' | sed 's/^/so:/' > /src/deps
 

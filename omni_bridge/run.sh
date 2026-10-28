@@ -8,6 +8,7 @@ export LMS_SERVER
 MA_PLAYER="$(bashio::config "ma_player")"
 [ "$MA_PLAYER" = "null" ] && MA_PLAYER=""
 export MA_PLAYER
+export SYNC_DELAY_MS="$(bashio::config 'sync_delay_ms')"
 export BITS_PER_SAMPLE="$(bashio::config 'quality')"
 export MQTT_HOST="$(bashio::services mqtt 'host')"
 export MQTT_PORT="$(bashio::services mqtt 'port')"
