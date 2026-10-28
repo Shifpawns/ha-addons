@@ -35,6 +35,8 @@ FRAME_BYTES = FRAME * 4
 LEAD = 1.5
 DATA_BYTES = 1316
 IDLE_STOP = 2.0
+SESSION_IDLE = 60
+FAST_SWITCH = os.environ.get("FAST_SWITCH", "true") == "true"
 GAP = bytes(256)
 START_DELAY = 1.5
 RESYNC_AFTER = 1.0
@@ -170,6 +172,7 @@ class Session:
         self.resent = {}
         self.encoder = Encoder(bits_per_sample=BITS)
         self.running = False
+        self.armed = False
         self.frame_no = 0
         self.counter = 0
         self.data = bytearray()
@@ -283,18 +286,42 @@ class Session:
                 break
         self.message("rate", copies=2)
         self.sync_burst(2, 3)
+        self.start_clock()
+        self.running = True
+        threading.Thread(target=self.housekeeping, daemon=True).start()
+        return True
+
+    def start_clock(self):
         spk = self.speaker_now()
         cfg = self.build("cfg1")
         put(cfg, 19, self.next_seq())
         put(cfg, 27, spk)
-        put(cfg, 29, spk + TICKS_PER_SEC)
+        put(cfg, 29, spk + int(START_DELAY * TICKS_PER_SEC))
         self.speaker.send(cfg)
         self.speaker.send(cfg)
         self.play_at = time.monotonic() + START_DELAY
         self.stream_start = time.monotonic()
-        self.running = True
-        threading.Thread(target=self.housekeeping, daemon=True).start()
-        return True
+        self.armed = True
+
+    def halt(self):
+        self.data = bytearray()
+        self.frame_off = None
+        self.last_off = None
+        self.message("stop", copies=2)
+        self.armed = False
+
+    def rearm(self):
+        self.encoder = Encoder(bits_per_sample=BITS)
+        self.frame_no = 0
+        self.packet_pos = 1
+        self.frame_pos = 1
+        self.marked = None
+        self.behind = 0.0
+        self.sync_burst(2, 3)
+        self.start_clock()
+
+    def played_out(self):
+        return time.monotonic() > self.play_at + self.frame_no * FRAME_SEC + 0.3
 
     def housekeeping(self):
         round_no = 3
@@ -443,6 +470,20 @@ def player(speaker, templates, client):
         buf = bytearray()
         session = None
         silent_since = None
+
+        def end_session(reason):
+            nonlocal session
+            log(f"{reason}, {session_stats(session)}")
+            session.close(wait=False)
+            speaker.session = None
+            session = None
+            client.publish(T_PLAYING, "OFF", retain=True)
+
+        def stop_audio(reason):
+            log(f"{reason}, {session_stats(session)}")
+            session.halt()
+            client.publish(T_PLAYING, "OFF", retain=True)
+
         while True:
             ready, _, _ = select.select([fd], [], [], 1.0)
             if not ready:
@@ -457,12 +498,11 @@ def player(speaker, templates, client):
                 drain(fd)
                 raw.clear()
                 buf.clear()
-                if session is not None:
-                    log(f"overgeslagen of gepauzeerd, {session_stats(session)}")
-                    session.close(wait=False)
-                    speaker.session = None
-                    session = None
-                    client.publish(T_PLAYING, "OFF", retain=True)
+                if session is not None and session.armed:
+                    if FAST_SWITCH:
+                        stop_audio("overgeslagen of gepauzeerd")
+                    else:
+                        end_session("overgeslagen of gepauzeerd")
                 continue
             raw += chunk
             usable = len(raw) & ~3
@@ -475,7 +515,7 @@ def player(speaker, templates, client):
                 silent_since = None
             elif silent_since is None:
                 silent_since = now
-            if session is None and buf:
+            if buf and session is None:
                 session = Session(speaker, templates)
                 speaker.session = session
                 if not session.open():
@@ -486,24 +526,31 @@ def player(speaker, templates, client):
                     continue
                 log("afspelen gestart")
                 client.publish(T_PLAYING, "ON", retain=True)
+            elif buf and not session.armed:
+                session.rearm()
+                log("afspelen gestart (zelfde sessie)")
+                client.publish(T_PLAYING, "ON", retain=True)
             while session is not None and len(buf) >= FRAME_BYTES and not speaker.flushed.is_set():
                 session.push(bytes(buf[:FRAME_BYTES]))
                 del buf[:FRAME_BYTES]
                 if session.behind > RESYNC_AFTER:
-                    log(f"te ver achter, sessie opnieuw starten, {session_stats(session)}")
-                    session.close(wait=False)
-                    speaker.session = None
-                    session = None
+                    end_session("te ver achter, sessie opnieuw starten")
                     time.sleep(0.5)
-            if session is not None and silent_since is not None and now - silent_since > IDLE_STOP:
-                if buf:
-                    session.push(bytes(buf.ljust(FRAME_BYTES, b"\0")), last=True)
-                    buf.clear()
-                session.close()
-                log(f"afspelen gestopt, {session_stats(session)}")
-                speaker.session = None
-                session = None
-                client.publish(T_PLAYING, "OFF", retain=True)
+            if session is not None and silent_since is not None:
+                quiet = now - silent_since
+                if session.armed and quiet > IDLE_STOP:
+                    if buf:
+                        session.push(bytes(buf.ljust(FRAME_BYTES, b"\0")), last=True)
+                        buf.clear()
+                    if session.data:
+                        session.flush()
+                    if session.played_out():
+                        if FAST_SWITCH:
+                            stop_audio("afspelen gestopt")
+                        else:
+                            end_session("afspelen gestopt")
+                elif not session.armed and quiet > SESSION_IDLE:
+                    end_session("sessie gesloten")
             if not got_audio:
                 time.sleep(0.02)
         if session is not None:
