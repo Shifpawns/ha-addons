@@ -67,7 +67,7 @@ T_VOLUME = f"{BASE}/volume"
 T_VOLUME_SET = f"{BASE}/volume/set"
 T_PLAYING = f"{BASE}/playing"
 
-KNOWN = {(1, 17), (1, 46), (3, 12), (3, 39), (4, 9), (6, 1), (6, 3), (6, 34), (6, 47)}
+KNOWN = {(1, 17), (1, 44), (1, 46), (3, 12), (3, 39), (4, 9), (6, 1), (6, 3), (6, 23), (6, 34), (6, 40), (6, 47)}
 HA_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
 MA_PLAYER = os.environ.get("MA_PLAYER", "")
 
@@ -118,7 +118,9 @@ class Speaker:
         self.seen = set()
         self.ma_volume = None
         self.ignore_ma_until = 0.0
-        self.on_speaker_stop = None
+        self.on_button = None
+        self.paused_at = 0.0
+        self.played_at = 0.0
         self.on_ma_volume = None
         self.sock = multicast_socket("", LOCAL_PORT, self.ip)
         self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, self.my_ip)
@@ -163,8 +165,18 @@ class Speaker:
             session = self.session
             if session is not None:
                 session.handle(key, pkt)
-                if key == (6, 23) and session.running and self.on_speaker_stop:
-                    self.on_speaker_stop()
+            if key in ((6, 23), (6, 40), (1, 44)):
+                log(f"speaker meldt {key}, sessie {'actief' if session and session.running else 'uit'}")
+            if key == (6, 23) and session is not None and session.running and not session.stopped_by_speaker:
+                session.stopped_by_speaker = True
+                self.paused_at = time.monotonic()
+                if self.on_button:
+                    self.on_button("media_pause")
+            elif key == (6, 40) and session is None and time.monotonic() - self.paused_at > 3:
+                if time.monotonic() - self.played_at > 3:
+                    self.played_at = time.monotonic()
+                    if self.on_button:
+                        self.on_button("media_play")
             if key not in KNOWN and key not in self.seen:
                 self.seen.add(key)
                 log(f"onbekend pakket {key} van speaker, {len(pkt)} bytes: {pkt[72:160].hex()}")
@@ -194,7 +206,7 @@ class Session:
         self.frame_pos = 1
         self.marked = None
         self.late = 0
-        self.phase = None
+        self.stopped_by_speaker = False
         self.behind = 0.0
         self.resend_count = 0
         self.last_sent = 0.0
@@ -215,13 +227,8 @@ class Session:
         if key == (3, 12) and len(pkt) >= 128:
             self.clock = struct.unpack_from("<I", pkt, 124)[0]
             self.clock_at = time.monotonic()
-        elif key == (4, 9):
-            phase = word(pkt, 25) if len(pkt) >= 104 else None
-            if phase != self.phase:
-                log(f"speaker fase {self.phase} -> {phase}")
-                self.phase = phase
-            if len(pkt) >= 156:
-                self.resend(pkt)
+        elif key == (4, 9) and len(pkt) >= 156:
+            self.resend(pkt)
         if key in self.events:
             self.events[key].set()
 
@@ -680,12 +687,12 @@ def main():
             log("volume uit MA ->", target)
             speaker.set_volume(target)
 
-    def on_speaker_stop():
-        log("speaker heeft de sessie gestopt, MA pauzeren")
-        threading.Thread(target=ma_service, args=("media_pause",), daemon=True).start()
+    def on_button(service):
+        log("knop op speaker ->", service)
+        threading.Thread(target=ma_service, args=(service,), daemon=True).start()
 
     speaker.on_ma_volume = on_ma_volume
-    speaker.on_speaker_stop = on_speaker_stop
+    speaker.on_button = on_button
 
     speaker.on_volume = on_volume
     client.on_connect = on_connect
