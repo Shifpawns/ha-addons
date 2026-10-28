@@ -67,7 +67,7 @@ T_VOLUME = f"{BASE}/volume"
 T_VOLUME_SET = f"{BASE}/volume/set"
 T_PLAYING = f"{BASE}/playing"
 
-KNOWN = {(1, 17), (1, 46), (3, 12), (3, 39), (4, 9), (6, 1), (6, 3), (6, 34)}
+KNOWN = {(1, 17), (1, 46), (3, 12), (3, 39), (4, 9), (6, 1), (6, 3), (6, 34), (6, 47)}
 HA_TOKEN = os.environ.get("SUPERVISOR_TOKEN", "")
 MA_PLAYER = os.environ.get("MA_PLAYER", "")
 
@@ -117,6 +117,7 @@ class Speaker:
         self.flushed = threading.Event()
         self.seen = set()
         self.ma_volume = None
+        self.ignore_ma_until = 0.0
         self.on_ma_volume = None
         self.sock = multicast_socket("", LOCAL_PORT, self.ip)
         self.sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_IF, self.my_ip)
@@ -473,6 +474,7 @@ def drain(fd):
 def player(speaker, templates, client):
     while True:
         log("squeezelite starten:", " ".join(squeezelite_command()))
+        speaker.ignore_ma_until = time.monotonic() + 10
         proc = subprocess.Popen(squeezelite_command(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         threading.Thread(target=watch_squeezelite, args=(proc.stderr, speaker), daemon=True).start()
         fd = proc.stdout.fileno()
@@ -657,6 +659,8 @@ def main():
             threading.Thread(target=ma_service, args=("volume_set", {"volume_level": volume / 50}), daemon=True).start()
 
     def on_ma_volume(volume):
+        if time.monotonic() < speaker.ignore_ma_until:
+            return
         target = (volume + 1) // 2
         speaker.ma_volume = target
         if target != speaker.volume:
