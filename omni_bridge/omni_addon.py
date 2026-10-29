@@ -679,7 +679,8 @@ def player(speaker, templates, client, source):
             meter_kept += len(audio)
             if time.monotonic() - meter_at >= 10:
                 span = time.monotonic() - meter_at
-                if session is not None:
+                rate = meter_raw / span / 1920
+                if session is not None and not 97 < rate < 103:
                     log(f"{source.name} levert {meter_raw / span / 1920:.1f}% realtime, na stilte-filter {meter_kept / span / 1920:.1f}%")
                 meter_at = time.monotonic()
                 meter_raw = 0
