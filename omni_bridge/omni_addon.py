@@ -177,6 +177,7 @@ class Speaker:
                 session.stopped_by_speaker = True
                 if self.source is not None:
                     self.source.flushed.set()
+                    self.source.hold_until = time.monotonic() + 4
                 self.paused_at = time.monotonic()
                 if self.on_button:
                     self.on_button("media_pause")
@@ -484,6 +485,7 @@ class Source:
         self.command = command
         self.shell = shell
         self.realtime = False
+        self.hold_until = 0.0
         self.flushed = threading.Event()
 
     def watch(self, stream, speaker):
@@ -670,6 +672,10 @@ def player(speaker, templates, client, source):
                 buf.clear()
                 if session is not None:
                     end("overgeslagen of gepauzeerd", False)
+                continue
+            if time.monotonic() < source.hold_until:
+                raw.clear()
+                buf.clear()
                 continue
             raw += chunk
             usable = len(raw) & ~3
