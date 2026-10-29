@@ -4,6 +4,7 @@ import json
 import re
 import urllib.request
 import os
+import queue
 import select
 import socket
 import struct
@@ -481,6 +482,7 @@ class Source:
         self.name = name
         self.command = command
         self.shell = shell
+        self.realtime = False
         self.flushed = threading.Event()
 
     def watch(self, stream, speaker):
@@ -513,7 +515,7 @@ class Squeezelite(Source):
 AIRPLAY_COMMAND = (
     "shairport-sync -c /etc/shairport-sync.conf"
     " | sox --buffer 4096 -t raw -r 44100 -e signed -b 16 -c 2 -L -"
-    " -t raw -r 48000 -e signed -b 16 -c 2 -L - rate -v"
+    " -t raw -r 48000 -e signed -b 16 -c 2 -L - rate -h"
 )
 METADATA_PIPE = "/tmp/shairport-sync-metadata"
 ITEM = re.compile(rb"<item><type>(\w+)</type><code>(\w+)</code><length>(\d+)</length>\s*(?:<data encoding=\"base64\">\s*([^<]*)</data>)?\s*</item>")
@@ -522,6 +524,7 @@ ITEM = re.compile(rb"<item><type>(\w+)</type><code>(\w+)</code><length>(\d+)</le
 class AirPlay(Source):
     def __init__(self):
         super().__init__("airplay", AIRPLAY_COMMAND, shell=True)
+        self.realtime = True
         self.dacp_id = None
         self.active_remote = None
         self.on_volume = None
@@ -591,6 +594,30 @@ def airplay_to_speaker(airplay_volume):
     return round((airplay_volume + 30) / 30 * 50)
 
 
+def buffered_pipe(fd):
+    read_end, write_end = os.pipe()
+    chunks = queue.Queue()
+
+    def reader():
+        while True:
+            chunk = os.read(fd, 65536)
+            chunks.put(chunk)
+            if not chunk:
+                return
+
+    def writer():
+        while True:
+            chunk = chunks.get()
+            if not chunk:
+                os.close(write_end)
+                return
+            os.write(write_end, chunk)
+
+    threading.Thread(target=reader, daemon=True).start()
+    threading.Thread(target=writer, daemon=True).start()
+    return read_end
+
+
 def drain(fd):
     while select.select([fd], [], [], 0)[0]:
         if not os.read(fd, 65536):
@@ -605,6 +632,8 @@ def player(speaker, templates, client, source):
         proc = subprocess.Popen(source.command, shell=source.shell, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         threading.Thread(target=source.watch, args=(proc.stderr, speaker), daemon=True).start()
         fd = proc.stdout.fileno()
+        if source.realtime:
+            fd = buffered_pipe(fd)
         raw = bytearray()
         buf = bytearray()
         session = None

@@ -1,3 +1,4 @@
+import array
 import ctypes
 import ctypes.util
 import os
@@ -105,10 +106,8 @@ class Encoder:
 
     def encode(self, pcm):
         frames = len(pcm) // 4
-        samples = (ctypes.c_int32 * (frames * 2))()
-        values = memoryview(pcm).cast("h")
-        for i in range(frames * 2):
-            samples[i] = values[i]
+        values = array.array("i", memoryview(pcm[: frames * 4]).cast("h"))
+        samples = (ctypes.c_int32 * (frames * 2)).from_buffer(values)
         self.blocks = []
         self.lib.WavpackPackSamples(self.ctx, samples, frames)
         self.lib.WavpackFlushSamples(self.ctx)
