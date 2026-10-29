@@ -174,6 +174,8 @@ class Speaker:
                 session.handle(key, pkt)
             if key == (6, 23) and session is not None and session.running and not session.stopped_by_speaker:
                 session.stopped_by_speaker = True
+                if self.source is not None:
+                    self.source.flushed.set()
                 self.paused_at = time.monotonic()
                 if self.on_button:
                     self.on_button("media_pause")
@@ -522,7 +524,6 @@ class AirPlay(Source):
         super().__init__("airplay", AIRPLAY_COMMAND, shell=True)
         self.dacp_id = None
         self.active_remote = None
-        self.client_ip = None
         self.on_volume = None
 
     def read_metadata(self):
@@ -554,8 +555,6 @@ class AirPlay(Source):
             self.dacp_id = value.decode()
         elif code == "acre":
             self.active_remote = value.decode()
-        elif code == "clip":
-            self.client_ip = value.decode()
         elif code == "pvol" and self.on_volume:
             airplay_volume = float(value.decode().split(",")[0])
             self.on_volume(airplay_volume)
@@ -578,12 +577,12 @@ class AirPlay(Source):
         if not found or not self.active_remote:
             log("airplay: telefoon niet gevonden voor", command)
             return
-        host = self.client_ip or found[0]
-        req = urllib.request.Request(f"http://{host}:{found[1]}/ctrl-int/1/{command}", headers={"Active-Remote": self.active_remote})
+        host, port = found
+        req = urllib.request.Request(f"http://{host}:{port}/ctrl-int/1/{command}", headers={"Active-Remote": self.active_remote})
         try:
             urllib.request.urlopen(req, timeout=3).read()
         except Exception as err:
-            log(f"airplay {command} mislukt:", err)
+            log(f"airplay {command} naar {host}:{port} mislukt:", err)
 
 
 def airplay_to_speaker(airplay_volume):
