@@ -43,8 +43,8 @@ DATA_BYTES = 1316
 IDLE_STOP = 2.0
 GAP = bytes(256)
 START_DELAY = 1.5
+REALTIME_START_DELAY = 1.0
 RESYNC_AFTER = 1.0
-STRETCH_BELOW = START_DELAY - 0.4
 OFFLINE_AFTER = 90
 
 AUDIO_CHECK = {
@@ -191,7 +191,8 @@ class Speaker:
 
 
 class Session:
-    def __init__(self, speaker, templates):
+    def __init__(self, speaker, templates, start_delay=START_DELAY):
+        self.start_delay = start_delay
         self.speaker = speaker
         self.templates = dict(templates)
         self.templates["audio_head"] = self.templates["audio"][:132]
@@ -331,10 +332,10 @@ class Session:
         cfg = self.build("cfg1")
         put(cfg, 19, self.next_seq())
         put(cfg, 27, spk)
-        put(cfg, 29, spk + int(START_DELAY * TICKS_PER_SEC))
+        put(cfg, 29, spk + int(self.start_delay * TICKS_PER_SEC))
         self.speaker.send(cfg)
         self.speaker.send(cfg)
-        self.play_at = time.monotonic() + START_DELAY
+        self.play_at = time.monotonic() + self.start_delay
         self.stream_start = time.monotonic()
 
     def housekeeping(self):
@@ -694,7 +695,7 @@ def player(speaker, templates, client, source):
                 with speaker.claim:
                     free = speaker.session is None
                     if free:
-                        session = Session(speaker, templates)
+                        session = Session(speaker, templates, REALTIME_START_DELAY if source.realtime else START_DELAY)
                         speaker.session = session
                         speaker.source = source
                 if not free:
@@ -718,7 +719,7 @@ def player(speaker, templates, client, source):
                 session.push(bytes(buf[:FRAME_BYTES]))
                 del buf[:FRAME_BYTES]
                 slack = session.play_at + session.frame_no * FRAME_SEC - time.monotonic()
-                if slack < STRETCH_BELOW and len(buf) >= 4:
+                if slack < session.start_delay - 0.4 and len(buf) >= 4:
                     buf[0:0] = buf[0:4]
                     session.stretched += 1
                 if session.behind > RESYNC_AFTER:

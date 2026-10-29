@@ -1,5 +1,5 @@
 name: Omni 10 Bridge
-version: "1.6.3"
+version: "1.6.4"
 slug: omni_bridge
 description: Volume en afspelen op een Harman Kardon Omni 10, met Music Assistant
 arch:
@@ -21,7 +21,7 @@ options:
   ma_player: ""
   sync_delay_ms: 2500
   airplay: true
-  airplay_offset: -2.0
+  airplay_offset: -1.0
 schema:
   speaker_ip: str
   speaker_name: str
