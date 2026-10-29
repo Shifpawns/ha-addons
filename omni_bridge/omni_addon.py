@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
+import base64
 import json
+import re
 import urllib.request
 import os
 import select
@@ -25,6 +27,7 @@ MQTT_PASS = os.environ.get("MQTT_PASS", "")
 LMS_SERVER = os.environ.get("LMS_SERVER", "")
 PLAYER_MAC = os.environ.get("PLAYER_MAC", "02:38:29:1e:0b:0d")
 SYNC_MS = int(float(os.environ.get("SYNC_DELAY_MS", "2500")))
+AIRPLAY = os.environ.get("AIRPLAY", "true") == "true"
 BITS = float(os.environ.get("BITS_PER_SAMPLE", "2.5"))
 
 SPEAKER_PORT = 6060
@@ -116,7 +119,9 @@ class Speaker:
         self.volume = None
         self.session = None
         self.on_volume = None
-        self.flushed = threading.Event()
+        self.claim = threading.Lock()
+        self.source = None
+        self.last_source = None
         self.seen = set()
         self.ma_volume = None
         self.ignore_ma_until = 0.0
@@ -206,6 +211,7 @@ class Session:
         self.frame_pos = 1
         self.marked = None
         self.late = 0
+        self.flushed = threading.Event()
         self.stretched = 0
         self.stopped_by_speaker = False
         self.behind = 0.0
@@ -399,7 +405,7 @@ class Session:
             self.stream_start + self.frame_no * FRAME_SEC / 4,
         )
         delay = due - time.monotonic()
-        if delay > 0 and self.speaker.flushed.wait(delay):
+        if delay > 0 and self.flushed.wait(delay):
             return
         late = time.monotonic() - (self.play_at + self.frame_no * FRAME_SEC - 0.2)
         self.behind = late
@@ -468,21 +474,122 @@ def gain_to_volume(gain):
     return min(range(101), key=lambda v: abs(GAINS[v] - gain))
 
 
-def watch_squeezelite(stream, speaker):
-    for line in stream:
-        line = line.decode(errors="replace").strip()
-        if "audg gainL:" in line:
-            parts = line.split()
-            gain = int(parts[parts.index("gainL:") + 1])
-            adjust = parts[parts.index("adjust:") + 1] != "0"
-            if adjust and speaker.on_ma_volume:
-                speaker.on_ma_volume(gain_to_volume(gain))
-        elif "strm command" in line:
-            command = line[-1]
-            if command in "qfp":
-                speaker.flushed.set()
-        elif "error" in line.lower() or "warn" in line.lower():
-            log("squeezelite:", line)
+class Source:
+    def __init__(self, name, command, shell=False):
+        self.name = name
+        self.command = command
+        self.shell = shell
+        self.flushed = threading.Event()
+
+    def watch(self, stream, speaker):
+        for line in stream:
+            line = line.decode(errors="replace").strip()
+            if line and ("error" in line.lower() or "warn" in line.lower()):
+                log(f"{self.name}:", line)
+
+
+class Squeezelite(Source):
+    def __init__(self):
+        super().__init__("squeezelite", squeezelite_command())
+
+    def watch(self, stream, speaker):
+        for line in stream:
+            line = line.decode(errors="replace").strip()
+            if "audg gainL:" in line:
+                parts = line.split()
+                gain = int(parts[parts.index("gainL:") + 1])
+                adjust = parts[parts.index("adjust:") + 1] != "0"
+                if adjust and speaker.on_ma_volume:
+                    speaker.on_ma_volume(gain_to_volume(gain))
+            elif "strm command" in line:
+                if line[-1] in "qfp":
+                    self.flushed.set()
+            elif "error" in line.lower() or "warn" in line.lower():
+                log("squeezelite:", line)
+
+
+AIRPLAY_COMMAND = (
+    "shairport-sync -c /etc/shairport-sync.conf"
+    " | sox --buffer 4096 -t raw -r 44100 -e signed -b 16 -c 2 -L -"
+    " -t raw -r 48000 -e signed -b 16 -c 2 -L - rate -v"
+)
+METADATA_PIPE = "/tmp/shairport-sync-metadata"
+ITEM = re.compile(rb"<item><type>(\w+)</type><code>(\w+)</code><length>(\d+)</length>\s*(?:<data encoding=\"base64\">\s*([^<]*)</data>)?\s*</item>")
+
+
+class AirPlay(Source):
+    def __init__(self):
+        super().__init__("airplay", AIRPLAY_COMMAND, shell=True)
+        self.dacp_id = None
+        self.active_remote = None
+        self.client_ip = None
+        self.on_volume = None
+
+    def read_metadata(self):
+        while True:
+            try:
+                with open(METADATA_PIPE, "rb") as pipe:
+                    data = b""
+                    while True:
+                        chunk = pipe.read1(4096)
+                        if not chunk:
+                            break
+                        data += chunk
+                        while True:
+                            match = ITEM.search(data)
+                            if not match:
+                                break
+                            data = data[match.end():]
+                            code = bytes.fromhex(match.group(2).decode()).decode(errors="replace")
+                            value = base64.b64decode(match.group(4)) if match.group(4) else b""
+                            self.metadata(code, value)
+            except OSError as err:
+                log("airplay metadata:", err)
+                time.sleep(2)
+
+    def metadata(self, code, value):
+        if code == "pfls":
+            self.flushed.set()
+        elif code == "daid":
+            self.dacp_id = value.decode()
+        elif code == "acre":
+            self.active_remote = value.decode()
+        elif code == "clip":
+            self.client_ip = value.decode()
+        elif code == "pvol" and self.on_volume:
+            airplay_volume = float(value.decode().split(",")[0])
+            self.on_volume(airplay_volume)
+
+    def find_remote(self):
+        if not self.dacp_id:
+            return None
+        try:
+            out = subprocess.run(["avahi-browse", "-rpt", "_dacp._tcp"], capture_output=True, text=True, timeout=6).stdout
+        except subprocess.TimeoutExpired:
+            return None
+        for line in out.splitlines():
+            parts = line.split(";")
+            if parts[0] == "=" and parts[2] == "IPv4" and parts[3] == f"iTunes_Ctrl_{self.dacp_id}":
+                return parts[7], parts[8]
+        return None
+
+    def remote(self, command):
+        found = self.find_remote()
+        if not found or not self.active_remote:
+            log("airplay: telefoon niet gevonden voor", command)
+            return
+        host = self.client_ip or found[0]
+        req = urllib.request.Request(f"http://{host}:{found[1]}/ctrl-int/1/{command}", headers={"Active-Remote": self.active_remote})
+        try:
+            urllib.request.urlopen(req, timeout=3).read()
+        except Exception as err:
+            log(f"airplay {command} mislukt:", err)
+
+
+def airplay_to_speaker(airplay_volume):
+    if airplay_volume <= -30:
+        return 0
+    return round((airplay_volume + 30) / 30 * 50)
 
 
 def drain(fd):
@@ -491,37 +598,46 @@ def drain(fd):
             return
 
 
-def player(speaker, templates, client):
+def player(speaker, templates, client, source):
     while True:
-        log("squeezelite starten:", " ".join(squeezelite_command()))
-        speaker.ignore_ma_until = time.monotonic() + 10
-        proc = subprocess.Popen(squeezelite_command(), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        threading.Thread(target=watch_squeezelite, args=(proc.stderr, speaker), daemon=True).start()
+        log(f"{source.name} starten")
+        if isinstance(source, Squeezelite):
+            speaker.ignore_ma_until = time.monotonic() + 10
+        proc = subprocess.Popen(source.command, shell=source.shell, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        threading.Thread(target=source.watch, args=(proc.stderr, speaker), daemon=True).start()
         fd = proc.stdout.fileno()
         raw = bytearray()
         buf = bytearray()
         session = None
         silent_since = None
+
+        def end(reason, wait):
+            nonlocal session
+            if wait and buf:
+                session.push(bytes(buf.ljust(FRAME_BYTES, b"\0")), last=True)
+            session.close(wait=wait)
+            log(f"{reason} ({source.name}), {session_stats(session)}")
+            speaker.session = None
+            speaker.source = None
+            session = None
+            client.publish(T_PLAYING, "OFF", retain=True)
+
         while True:
-            ready, _, _ = select.select([fd], [], [], 1.0)
-            if not ready:
-                if proc.poll() is not None:
+            ready, _, _ = select.select([fd], [], [], 0.5)
+            chunk = b""
+            if ready:
+                chunk = os.read(fd, 65536)
+                if not chunk:
                     break
-                continue
-            chunk = os.read(fd, 65536)
-            if not chunk:
+            elif proc.poll() is not None:
                 break
-            if speaker.flushed.is_set():
-                speaker.flushed.clear()
+            if source.flushed.is_set():
+                source.flushed.clear()
                 drain(fd)
                 raw.clear()
                 buf.clear()
                 if session is not None:
-                    log(f"overgeslagen of gepauzeerd, {session_stats(session)}")
-                    session.close(wait=False)
-                    speaker.session = None
-                    session = None
-                    client.publish(T_PLAYING, "OFF", retain=True)
+                    end("overgeslagen of gepauzeerd", False)
                 continue
             raw += chunk
             usable = len(raw) & ~3
@@ -535,17 +651,30 @@ def player(speaker, templates, client):
             elif silent_since is None:
                 silent_since = now
             if session is None and buf:
-                session = Session(speaker, templates)
-                speaker.session = session
+                with speaker.claim:
+                    free = speaker.session is None
+                    if free:
+                        session = Session(speaker, templates)
+                        speaker.session = session
+                        speaker.source = source
+                if not free:
+                    other = speaker.source
+                    if other is not None and other is not source:
+                        other.flushed.set()
+                    del buf[:-FRAME_BYTES * 16]
+                    continue
+                speaker.last_source = source
                 if not session.open():
                     speaker.session = None
+                    speaker.source = None
                     session = None
                     buf.clear()
                     time.sleep(2)
                     continue
-                log("afspelen gestart")
+                session.flushed = source.flushed
+                log(f"afspelen gestart ({source.name})")
                 client.publish(T_PLAYING, "ON", retain=True)
-            while session is not None and len(buf) >= FRAME_BYTES and not speaker.flushed.is_set():
+            while session is not None and len(buf) >= FRAME_BYTES and not source.flushed.is_set():
                 session.push(bytes(buf[:FRAME_BYTES]))
                 del buf[:FRAME_BYTES]
                 slack = session.play_at + session.frame_no * FRAME_SEC - time.monotonic()
@@ -553,28 +682,17 @@ def player(speaker, templates, client):
                     buf[0:0] = buf[0:4]
                     session.stretched += 1
                 if session.behind > RESYNC_AFTER:
-                    log(f"te ver achter, sessie opnieuw starten, {session_stats(session)}")
-                    session.close(wait=False)
-                    speaker.session = None
-                    session = None
+                    end("te ver achter, sessie opnieuw starten", False)
                     time.sleep(0.5)
             if session is not None and silent_since is not None and now - silent_since > IDLE_STOP:
-                if buf:
-                    session.push(bytes(buf.ljust(FRAME_BYTES, b"\0")), last=True)
-                    buf.clear()
-                session.close()
-                log(f"afspelen gestopt, {session_stats(session)}")
-                speaker.session = None
-                session = None
-                client.publish(T_PLAYING, "OFF", retain=True)
-            if not got_audio:
+                end("afspelen gestopt", True)
+                buf.clear()
+            if ready and not got_audio:
                 time.sleep(0.02)
         if session is not None:
-            session.close()
-            speaker.session = None
-            client.publish(T_PLAYING, "OFF", retain=True)
+            end("bron gestopt", True)
         proc.wait()
-        log("squeezelite gestopt, opnieuw over 3 s")
+        log(f"{source.name} gestopt, opnieuw over 3 s")
         time.sleep(3)
 
 
@@ -650,6 +768,8 @@ def discovery(client):
 
 def main():
     os.environ["DEVICE_FRAMES"] = str(SYNC_MS * 48)
+    squeezelite = Squeezelite()
+    airplay = AirPlay() if AIRPLAY else None
     templates = {k: bytes.fromhex(v) for k, v in json.load(open(os.path.join(HERE, "templates.json"))).items()}
     speaker = Speaker()
     log(f"add-on op {speaker.ip}, speaker {SPEAKER}, mqtt {MQTT_HOST}:{MQTT_PORT}")
@@ -679,6 +799,11 @@ def main():
 
     def on_volume(volume):
         client.publish(T_VOLUME, str(volume), retain=True)
+        if airplay and speaker.source is airplay and volume != speaker.airplay_target:
+            if time.monotonic() > speaker.airplay_wait:
+                speaker.airplay_wait = time.monotonic() + 0.6
+                step = "volumeup" if volume > (speaker.airplay_target or 0) else "volumedown"
+                threading.Thread(target=airplay.remote, args=(step,), daemon=True).start()
         if volume != speaker.ma_volume:
             speaker.ma_volume = volume
             speaker.ignore_ma_until = max(speaker.ignore_ma_until, time.monotonic() + 1.5)
@@ -695,9 +820,22 @@ def main():
 
     def on_button(service):
         log("knop op speaker ->", service)
-        threading.Thread(target=ma_service, args=(service,), daemon=True).start()
+        if airplay and speaker.last_source is airplay:
+            command = "pause" if service == "media_pause" else "play"
+            threading.Thread(target=airplay.remote, args=(command,), daemon=True).start()
+        else:
+            threading.Thread(target=ma_service, args=(service,), daemon=True).start()
+
+    def on_airplay_volume(airplay_volume):
+        target = airplay_to_speaker(airplay_volume)
+        speaker.airplay_target = target
+        if target != speaker.volume:
+            log("volume uit airplay ->", target)
+            speaker.set_volume(target)
 
     speaker.on_ma_volume = on_ma_volume
+    speaker.airplay_target = None
+    speaker.airplay_wait = 0.0
     speaker.on_button = on_button
 
     speaker.on_volume = on_volume
@@ -717,7 +855,11 @@ def main():
             time.sleep(5)
 
     threading.Thread(target=watchdog, daemon=True).start()
-    player(speaker, templates, client)
+    if airplay:
+        airplay.on_volume = on_airplay_volume
+        threading.Thread(target=airplay.read_metadata, daemon=True).start()
+        threading.Thread(target=player, args=(speaker, templates, client, airplay), daemon=True).start()
+    player(speaker, templates, client, squeezelite)
 
 
 if __name__ == "__main__":

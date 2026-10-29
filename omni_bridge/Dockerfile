@@ -16,9 +16,9 @@ FROM ghcr.io/home-assistant/${BUILD_ARCH}-base:latest
 
 COPY --from=build /src/squeezelite /usr/bin/squeezelite
 COPY --from=build /src/deps /tmp/deps
-RUN apk add --no-cache python3 py3-paho-mqtt wavpack $(cat /tmp/deps)
+RUN apk add --no-cache python3 py3-paho-mqtt wavpack shairport-sync avahi avahi-tools dbus sox $(cat /tmp/deps)
 
-COPY omni_addon.py wvenc.py templates.json /app/
+COPY omni_addon.py wvenc.py templates.json avahi-daemon.conf shairport-sync.conf /app/
 COPY run.sh /run.sh
 RUN chmod a+x /run.sh
 
