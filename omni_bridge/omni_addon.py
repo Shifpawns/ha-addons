@@ -609,6 +609,9 @@ def player(speaker, templates, client, source):
         buf = bytearray()
         session = None
         silent_since = None
+        meter_at = time.monotonic()
+        meter_raw = 0
+        meter_kept = 0
 
         def end(reason, wait):
             nonlocal session
@@ -642,6 +645,15 @@ def player(speaker, templates, client, source):
             usable = len(raw) & ~3
             audio = strip_silence(bytes(raw[:usable]))
             del raw[:usable]
+            meter_raw += usable
+            meter_kept += len(audio)
+            if time.monotonic() - meter_at >= 10:
+                span = time.monotonic() - meter_at
+                if session is not None:
+                    log(f"{source.name} levert {meter_raw / span / 1920:.1f}% realtime, na stilte-filter {meter_kept / span / 1920:.1f}%")
+                meter_at = time.monotonic()
+                meter_raw = 0
+                meter_kept = 0
             got_audio = any(audio)
             buf += audio
             now = time.monotonic()
